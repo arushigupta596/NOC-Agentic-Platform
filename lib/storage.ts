@@ -2,7 +2,12 @@ import fs from "fs";
 import path from "path";
 import { RunResult } from "./schemas";
 
-const OUTPUTS_DIR = path.join(process.cwd(), "outputs");
+// On Vercel, process.cwd() points to /var/task which is read-only.
+// Use /tmp for serverless environments; fall back to local outputs/ for dev.
+const isVercel = !!process.env.VERCEL;
+const OUTPUTS_DIR = isVercel
+  ? path.join("/tmp", "outputs")
+  : path.join(process.cwd(), "outputs");
 
 function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) {
