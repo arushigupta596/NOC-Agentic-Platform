@@ -2,9 +2,11 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { useRunContext } from "@/app/context/RunContext";
 
 export default function HomePage() {
   const router = useRouter();
+  const { saveRun } = useRunContext();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -45,6 +47,8 @@ export default function HomePage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Analysis failed");
 
+      // Save full run result to sessionStorage so dashboard/site pages can read it
+      saveRun(data);
       router.push(`/runs/${data.runId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");

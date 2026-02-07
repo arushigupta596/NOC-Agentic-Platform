@@ -5,26 +5,32 @@ import { useParams } from "next/navigation";
 import { RunResult } from "@/lib/schemas";
 import SiteTable from "@/app/components/SiteTable";
 import ExecSummary from "@/app/components/ExecSummary";
+import { useRunContext } from "@/app/context/RunContext";
 
 export default function RunDashboard() {
   const params = useParams();
   const runId = params.runId as string;
+  const { loadRun: loadRunFromCtx } = useRunContext();
   const [run, setRun] = useState<RunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // Try sessionStorage first (set by home page after analysis)
+    const cached = loadRunFromCtx(runId);
+    if (cached) {
+      setRun(cached);
+      setLoading(false);
+      return;
+    }
+
+    // Fallback: try the API (works locally; may fail on Vercel across instances)
     async function fetchRun() {
       try {
         const res = await fetch(`/api/run/${runId}`);
-        if (!res.ok) throw new Error("Failed to fetch run");
+        if (!res.ok) throw new Error("Run not found. Please run a new analysis from the home page.");
         const data = await res.json();
         setRun(data);
-
-        // Poll if still running
-        if (data.status === "running") {
-          setTimeout(fetchRun, 3000);
-        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unknown error");
       } finally {
@@ -32,7 +38,7 @@ export default function RunDashboard() {
       }
     }
     fetchRun();
-  }, [runId]);
+  }, [runId, loadRunFromCtx]);
 
   if (loading) {
     return (

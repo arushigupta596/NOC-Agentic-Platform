@@ -5,25 +5,33 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import { SiteResult } from "@/lib/schemas";
 import ForecastChart from "@/app/components/ForecastChart";
+import { useRunContext } from "@/app/context/RunContext";
 
 export default function SiteDetail() {
   const params = useParams();
   const runId = params.runId as string;
   const siteId = params.siteId as string;
+  const { loadSite } = useRunContext();
   const [site, setSite] = useState<SiteResult | null>(null);
-  const [history, setHistory] = useState<{ date: string; traffic_gb: number }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // Try sessionStorage first
+    const cached = loadSite(runId, siteId);
+    if (cached) {
+      setSite(cached);
+      setLoading(false);
+      return;
+    }
+
+    // Fallback: try the API
     async function fetchSite() {
       try {
         const res = await fetch(`/api/site/${runId}/${siteId}`);
-        if (!res.ok) throw new Error("Failed to fetch site");
+        if (!res.ok) throw new Error("Site not found. Please run a new analysis from the home page.");
         const data = await res.json();
         setSite(data);
-        // Extract history from data quality (we'll approximate from forecast context)
-        // The API returns the full site result, we can derive history from the run
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unknown error");
       } finally {
@@ -31,7 +39,7 @@ export default function SiteDetail() {
       }
     }
     fetchSite();
-  }, [runId, siteId]);
+  }, [runId, siteId, loadSite]);
 
   if (loading) return <div className="text-center py-12 text-gray-500">Loading site details...</div>;
   if (error) return <div className="p-4 bg-red-50 border border-red-200 rounded text-red-700">{error}</div>;
@@ -73,7 +81,7 @@ export default function SiteDetail() {
       <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
         <h3 className="text-md font-semibold mb-4">Traffic Forecast</h3>
         <ForecastChart
-          history={[]} // History would need to come from a separate API or be embedded
+          history={[]}
           forecast={site.forecast}
           capacityGb={site.capacity_gb}
         />

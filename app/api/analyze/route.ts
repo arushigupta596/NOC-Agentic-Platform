@@ -25,7 +25,6 @@ export async function POST(request: NextRequest) {
       createdAt: new Date().toISOString(),
       sites: [],
     };
-    saveRun(run);
 
     // Load and group data
     const rows = loadCSV(params.dataset);
@@ -208,7 +207,7 @@ export async function POST(request: NextRequest) {
       // LLM unavailable — skip evaluator
     }
 
-    // Save final result
+    // Build final result
     const finalRun: RunResult = {
       ...run,
       status: "done",
@@ -216,9 +215,12 @@ export async function POST(request: NextRequest) {
       sites: siteResults,
       evaluator,
     };
-    saveRun(finalRun);
 
-    return NextResponse.json({ runId, status: "done" });
+    // Best-effort save (may fail on Vercel cold starts across instances)
+    try { saveRun(finalRun); } catch { /* ignore */ }
+
+    // Return full result inline — Vercel serverless instances don't share /tmp
+    return NextResponse.json(finalRun);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 400 });
