@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
+import { z } from "zod";
 import { AnalyzeRequestSchema, RunResult, SiteResult, AnalystOutputSchema, PlannerOutputSchema, EvaluatorOutputSchema, RiskExplanationSchema } from "@/lib/schemas";
 import { loadCSV, groupBySite, generateQualityReport, applyScenario } from "@/lib/dataLoader";
 import { computeSiteStats } from "@/lib/stats";
@@ -9,7 +10,7 @@ import { callWithSchema, loadPrompt } from "@/lib/openrouter";
 import { fetchForecast } from "@/forecasting-client/llmtimeClient";
 import { saveRun } from "@/lib/storage";
 
-export const maxDuration = 120; // Allow up to 2 minutes for Vercel
+export const maxDuration = 120; // Allow up to 2 minutes for Vercel Pro
 
 export async function POST(request: NextRequest) {
   try {
@@ -33,149 +34,146 @@ export async function POST(request: NextRequest) {
     }
     const siteGroups = groupBySite(rows);
 
-    // Load prompts
+    // Load prompts once (sync, fast)
     const analystPrompt = loadPrompt("analyst.system.txt");
     const plannerPrompt = loadPrompt("planner.system.txt");
     const riskExplainerPrompt = loadPrompt("risk-explainer.system.txt");
+    const evaluatorPrompt = loadPrompt("evaluator.system.txt");
 
-    const siteResults: SiteResult[] = [];
+    // ---------- Process all sites in PARALLEL ----------
+    const siteEntries = Array.from(siteGroups.entries());
 
-    // Process each site
-    for (const [siteId, siteRows] of siteGroups) {
-      // Data quality
-      const qualityReport = generateQualityReport(siteId, siteRows);
+    const siteResults: SiteResult[] = await Promise.all(
+      siteEntries.map(async ([siteId, siteRows]) => {
+        // Data quality
+        const qualityReport = generateQualityReport(siteId, siteRows);
 
-      // Apply scenario
-      const processedRows = applyScenario(siteRows, qualityReport, params.scenario ?? {});
+        // Apply scenario
+        const processedRows = applyScenario(siteRows, qualityReport, params.scenario ?? {});
 
-      // Stats
-      const stats = computeSiteStats(siteId, processedRows);
+        // Stats (deterministic, fast)
+        const stats = computeSiteStats(siteId, processedRows);
 
-      // Call forecast service
-      let forecast;
-      try {
-        forecast = await fetchForecast({
-          site_id: siteId,
-          dates: processedRows.map((r) => r.date),
-          traffic_gb: processedRows.map((r) => r.traffic_gb),
-          horizon: params.horizonDays,
-          samples: params.samples,
-        });
-      } catch (forecastError) {
-        // Fallback: create a simple linear extrapolation
-        const lastTraffic = processedRows[processedRows.length - 1]?.traffic_gb ?? 0;
-        const trend = stats.avg_last_7d - stats.avg_prev_14d;
-        const forecastDates: string[] = [];
-        const p10: number[] = [];
-        const p50: number[] = [];
-        const p90: number[] = [];
-        const lastDate = new Date(processedRows[processedRows.length - 1]?.date ?? "2024-01-01");
-        for (let i = 0; i < params.horizonDays; i++) {
-          const d = new Date(lastDate.getTime() + (i + 1) * 86400000);
-          forecastDates.push(d.toISOString().split("T")[0]);
-          const base = lastTraffic + trend * (i / 7);
-          p50.push(Math.round(base));
-          p10.push(Math.round(base * 0.9));
-          p90.push(Math.round(base * 1.15));
-        }
-        forecast = { site_id: siteId, forecast_dates: forecastDates, p10, p50, p90 };
-      }
-
-      // Risk
-      const risk = computeRisk({
-        site_id: siteId,
-        forecast,
-        capacity_gb: stats.capacity_gb,
-        thresholds: params.thresholds,
-      });
-
-      // Scoring
-      const scoring = computeScore(risk, stats, forecast, params.thresholds);
-
-      // LLM Analyst (best effort)
-      let analyst;
-      try {
-        const analystInput = JSON.stringify({
-          site_id: siteId,
-          region: stats.region,
-          site_type: stats.site_type,
-          recent_stats: {
-            avg_7d: stats.avg_last_7d,
-            peak_7d: stats.peak_traffic,
-            avg_utilization: stats.avg_utilization,
-            peak_utilization: stats.peak_utilization,
-            volatility: stats.volatility,
-          },
-          recent_outliers: qualityReport.outliers,
-          capacity_gb: stats.capacity_gb,
-          last_observed_utilization_pct: siteRows[siteRows.length - 1]?.utilization_pct ?? 0,
-        });
-        analyst = await callWithSchema(analystPrompt, analystInput, AnalystOutputSchema);
-      } catch {
-        // LLM unavailable — skip analyst
-      }
-
-      // LLM Planner (for AMBER/RED sites)
-      let planner;
-      if (risk.severity !== "GREEN") {
+        // Forecast (external service call)
+        let forecast;
         try {
-          const plannerInput = JSON.stringify({
+          forecast = await fetchForecast({
             site_id: siteId,
-            severity: risk.severity,
-            risk_windows: risk.risk_windows,
-            site_type: stats.site_type,
+            dates: processedRows.map((r) => r.date),
+            traffic_gb: processedRows.map((r) => r.traffic_gb),
+            horizon: params.horizonDays,
+            samples: params.samples,
+          });
+        } catch {
+          // Fallback: simple linear extrapolation
+          const lastTraffic = processedRows[processedRows.length - 1]?.traffic_gb ?? 0;
+          const trend = stats.avg_last_7d - stats.avg_prev_14d;
+          const forecastDates: string[] = [];
+          const p10: number[] = [];
+          const p50: number[] = [];
+          const p90: number[] = [];
+          const lastDate = new Date(processedRows[processedRows.length - 1]?.date ?? "2024-01-01");
+          for (let i = 0; i < params.horizonDays; i++) {
+            const d = new Date(lastDate.getTime() + (i + 1) * 86400000);
+            forecastDates.push(d.toISOString().split("T")[0]);
+            const base = lastTraffic + trend * (i / 7);
+            p50.push(Math.round(base));
+            p10.push(Math.round(base * 0.9));
+            p90.push(Math.round(base * 1.15));
+          }
+          forecast = { site_id: siteId, forecast_dates: forecastDates, p10, p50, p90 };
+        }
+
+        // Risk & Scoring (deterministic, fast)
+        const risk = computeRisk({
+          site_id: siteId,
+          forecast,
+          capacity_gb: stats.capacity_gb,
+          thresholds: params.thresholds,
+        });
+        const scoring = computeScore(risk, stats, forecast, params.thresholds);
+
+        // ---------- LLM calls for this site IN PARALLEL ----------
+        const llmPromises: [
+          Promise<z.infer<typeof AnalystOutputSchema> | undefined>,
+          Promise<z.infer<typeof PlannerOutputSchema> | undefined>,
+          Promise<string | undefined>,
+        ] = [
+          // Analyst
+          callWithSchema(analystPrompt, JSON.stringify({
+            site_id: siteId,
             region: stats.region,
-            data_quality_notes: qualityReport.notes,
+            site_type: stats.site_type,
+            recent_stats: {
+              avg_7d: stats.avg_last_7d,
+              peak_7d: stats.peak_traffic,
+              avg_utilization: stats.avg_utilization,
+              peak_utilization: stats.peak_utilization,
+              volatility: stats.volatility,
+            },
+            recent_outliers: qualityReport.outliers,
             capacity_gb: stats.capacity_gb,
+            last_observed_utilization_pct: siteRows[siteRows.length - 1]?.utilization_pct ?? 0,
+          }), AnalystOutputSchema).catch(() => undefined),
+
+          // Planner (only for AMBER/RED)
+          risk.severity !== "GREEN"
+            ? callWithSchema(plannerPrompt, JSON.stringify({
+                site_id: siteId,
+                severity: risk.severity,
+                risk_windows: risk.risk_windows,
+                site_type: stats.site_type,
+                region: stats.region,
+                data_quality_notes: qualityReport.notes,
+                capacity_gb: stats.capacity_gb,
+                p50_peak_util: risk.p50_peak_util,
+                p90_peak_util: risk.p90_peak_util,
+              }), PlannerOutputSchema).catch(() => undefined)
+            : Promise.resolve(undefined),
+
+          // Risk Explainer
+          callWithSchema(riskExplainerPrompt, JSON.stringify({
+            site_id: siteId,
+            region: stats.region,
+            site_type: stats.site_type,
+            severity: risk.severity,
             p50_peak_util: risk.p50_peak_util,
             p90_peak_util: risk.p90_peak_util,
-          });
-          planner = await callWithSchema(plannerPrompt, plannerInput, PlannerOutputSchema);
-        } catch {
-          // LLM unavailable — skip planner
-        }
-      }
+            risk_windows: risk.risk_windows.length,
+            reason: risk.reason,
+            capacity_gb: stats.capacity_gb,
+          }), RiskExplanationSchema)
+            .then((expl) => `**How:** ${expl.how}\n\n**Why it matters:** ${expl.why}`)
+            .catch(() => undefined),
+        ];
 
-      // LLM Risk Explainer — plain-language how & why
-      try {
-        const explainerInput = JSON.stringify({
+        const [analyst, planner, riskExplanation] = await Promise.all(llmPromises);
+
+        if (riskExplanation) {
+          risk.risk_explanation = riskExplanation;
+        }
+
+        return {
           site_id: siteId,
           region: stats.region,
           site_type: stats.site_type,
-          severity: risk.severity,
-          p50_peak_util: risk.p50_peak_util,
-          p90_peak_util: risk.p90_peak_util,
-          risk_windows: risk.risk_windows.length,
-          reason: risk.reason,
           capacity_gb: stats.capacity_gb,
-        });
-        const explanation = await callWithSchema(riskExplainerPrompt, explainerInput, RiskExplanationSchema);
-        risk.risk_explanation = `**How:** ${explanation.how}\n\n**Why it matters:** ${explanation.why}`;
-      } catch {
-        // LLM unavailable — skip explanation
-      }
-
-      siteResults.push({
-        site_id: siteId,
-        region: stats.region,
-        site_type: stats.site_type,
-        capacity_gb: stats.capacity_gb,
-        data_quality: qualityReport,
-        forecast,
-        risk,
-        scoring,
-        analyst,
-        planner,
-      });
-    }
+          data_quality: qualityReport,
+          forecast,
+          risk,
+          scoring,
+          analyst,
+          planner,
+        } as SiteResult;
+      })
+    );
 
     // Sort by priority score descending
     siteResults.sort((a, b) => b.scoring.priority_score - a.scoring.priority_score);
 
-    // LLM Evaluator — exec summary
+    // ---------- LLM Evaluator — exec summary ----------
     let evaluator;
     try {
-      const evaluatorPrompt = loadPrompt("evaluator.system.txt");
       const redCount = siteResults.filter((s) => s.risk.severity === "RED").length;
       const amberCount = siteResults.filter((s) => s.risk.severity === "AMBER").length;
       const greenCount = siteResults.filter((s) => s.risk.severity === "GREEN").length;
@@ -202,7 +200,9 @@ export async function POST(request: NextRequest) {
           sites_with_missing_data: siteResults.filter((s) => s.data_quality.missing_days > 0).length,
         },
       });
-      evaluator = await callWithSchema(evaluatorPrompt, evalInput, EvaluatorOutputSchema);
+      evaluator = await callWithSchema(evaluatorPrompt, evalInput, EvaluatorOutputSchema, {
+        model: "anthropic/claude-sonnet-4",
+      });
     } catch {
       // LLM unavailable — skip evaluator
     }

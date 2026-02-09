@@ -36,7 +36,7 @@ async function callOpenRouter(
   }
 
   const {
-    model = "anthropic/claude-sonnet-4",
+    model = "anthropic/claude-3.5-haiku",
     temperature = 0.2,
     maxTokens = 1024,
   } = options;
